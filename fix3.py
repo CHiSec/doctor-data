@@ -15,15 +15,12 @@ from fake_useragent import UserAgent
 import random
 import time
 import grequests
-
+from queue import Queue
 
 
 def get_random_ip(ip_list):
-    proxy_list = []
-    for ip in ip_list:
-        proxy_list.append('http://' + ip)
-    proxy_ip = random.choice(proxy_list)
-    proxies = {'http': proxy_ip}
+    proxy_ip = random.choice(ip_list)
+    proxies = {'https': 'https://'+proxy_ip}
     return proxies
 
 
@@ -85,7 +82,7 @@ def pull_data_from_haodf(link):
 
 # init ua & proxies
 ua = UserAgent()
-file = open('./data/ip_list.json', 'r')
+file = open('./data/ip_list_https.json', 'r')
 ip_list_json = file.read()
 file.close()
 ip_list = json.loads(ip_list_json)
@@ -95,28 +92,6 @@ file = open('./data/好大夫_modified_2.json', 'r')
 json_str = file.read()
 file.close()
 data = json.loads(json_str)
-
-# # 创建一个没有link的dict，以及一个有多link的问题数据dict
-# data_without_link = []
-# data_without_link_to_be_solved = []
-# for one in data:
-#     line = {'名字': one['名字'], '科室': one['科室'], '医院名称': one['医院名称']}
-#     if line not in data_without_link:
-#         data_without_link.append(line)
-#     else:
-#         if line not in data_without_link_to_be_solved:
-#             data_without_link_to_be_solved.append(line)
-#
-# # 解决问题
-# for one in data_without_link_to_be_solved:
-#     links = []
-#     print('处理：'+str(one))
-#     for line in data:
-#         if line['名字'] == one['名字'] and line['科室'] == one['科室'] and line['医院名称'] == one['医院名称']:
-#             links.append(line['link'])
-#     for link in links:
-#         pull_data_from_haodf(link)
-#         print()
 
 def pull_data_from_haodf_gq(r):
     print(r.status_code)
@@ -146,42 +121,78 @@ def pull_data_from_haodf_gq(r):
 
     return {'职称': zc, '擅长': sc}
 
-tasks = []
-for i in range(10):
-    tasks.append(grequests.get(data[i+50]['link'], timeout=3, headers=get_header(), proxies=get_random_ip(ip_list)))
-    # print(data[i]['link'])
-
-data_new = []
-for r in grequests.map(tasks, size=50):
-    if r is not None and r.status_code == 200:
-        res = pull_data_from_haodf_gq(r)
-        data_new.append(res)
-    else:
-        print(r.status_code)
-
 # todo 加入队列实现失败重试，加入try catch...
 
 
-def pulling_task(step, offset):
+def add_id(data):
+    i = 0
+    return [{**e, 'id': i} for e in data]
+
+
+def e_handler(request, exception):
+    print("Request failed: ", request, ", exception: ", exception)
+
+
+def pulling_task(data, count):
+    data_removed = []
     tasks = []
-    for i in range(step):
-        tasks.append(
-            grequests.get(data[i + offset]['link'], timeout=3, headers=get_header(), proxies=get_random_ip(ip_list)))
-        # print(data[i]['link'])
+    for i in data:
+        tasks.append(grequests.get(i['link'], headers=get_header(), proxies=get_random_ip(ip_list), timeout=3))
 
     data_new = []
-    for r in grequests.map(tasks, size=50):
-        if r is not None and r.status_code == 200:
-            res = pull_data_from_haodf_gq(r)
-            data_new.append(res)
-        else:
-            print(r.status_code)
+    for r in grequests.imap(tasks, size=200):
+        if r is not None and (r.status_code == 200 or r.status_code == 404):
+            if r.status_code == 200 or r.status_code == 404:
+                for i in data:
+                    if i['link'] == r.url:
+                        if r.status_code == 200:
+                            print('count: ', count)
+                            count = count+1
+                            data_new.append({**i, **pull_data_from_haodf_gq(r)})
+                            data.remove(i)
+                        elif r.status_code == 404:
+                            data_removed.append(i)
+                            data.remove(i)
+                        break
+            else:
+                print(r.status_code)
+        # else:
+        #     print('None Error')
+    # retry
+    # if len(data) > 0:
+    #     data_new.extend(pulling_task(data, data_removed, count))
+    return {"new":data_new, "remain": data, "count": count, "removed": data_removed}
 
 
-# 导出json
-output = open('./data/好大夫_modified_3.json', 'w+')
-output.write(json.dumps(data))
-output.close()
+data_new = []
+data_removed = []
+step = 200
+offset = 0
+data_block = []
+count = 0
+while len(data_new) + len(data_removed) < len(data):
+    print('block: ', len(data_block))
+    if offset + step > len(data):
+        data_block.extend(data[offset:])
+    elif len(data_block) == 0:
+        data_block = data[offset: offset + step]
+        offset = offset + step
+    else:
+        offset = offset + step - len(data_block)
+        data_block.extend(data[offset: offset + step - len(data_block)])
+    res = pulling_task(data_block, count)
+    data_removed.extend(res['removed'])
+    data_new.extend(res['new'])
+    data_block = res['remain']
+    count = res['count']
+    # 导出json
+    output = open('./data/好大夫_modified_3.json', 'w+')
+    output.write(json.dumps(data_new))
+    output.close()
+    output = open('./data/好大夫_removed_3.json', 'w+')
+    output.write(json.dumps(data_removed))
+    output.close()
+
 
 if __name__ == '__main__':
     print('test')
